@@ -2,7 +2,7 @@ import tempfile
 from pathlib import Path
 import uvicorn
 from fastapi import FastAPI, File, UploadFile, Query
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import shutil
@@ -11,7 +11,18 @@ import asyncio
 import json
 import librosa
 import numpy as np
-from music21 import stream, note, tempo, meter
+from music21.musicxml.m21ToXml import GeneralObjectExporter
+
+from music21 import (
+    stream,
+    note,
+    tempo,
+    meter,
+    metadata,
+    instrument,
+    midi,
+    duration as m21duration,
+)
 
 # --- Global Setup ---
 # Create a static directory to serve the output files from
@@ -102,50 +113,132 @@ def separate_audio_live_endpoint(file: UploadFile = File(...)):
     return StreamingResponse(separation_generator(file), media_type="text/event-stream")
 
 
-def audio_to_sheet_music(audio_path: Path, output_path_musicxml: Path):
-    y, sr = librosa.load(str(audio_path))
-    onset_env = librosa.onset.onset_strength(y=y, sr=sr)
-    bpm = librosa.beat.tempo(onset_envelope=onset_env, sr=sr)[0]
-
-    pitches, magnitudes = librosa.piptrack(y=y, sr=sr)
-    notes = []
-    for t in range(pitches.shape[1]):
-        idx = magnitudes[:, t].argmax()
-        pitch = pitches[idx, t]
-        if pitch > 0:
-            notes.append(librosa.hz_to_midi(pitch))
-
-    if not notes:
-        raise RuntimeError("No notes detected in audio.")
-
-    frame_duration = librosa.get_duration(y=y, sr=sr) / pitches.shape[1]
-    note_events, current_note, start_time = [], notes[0], 0
-
-    for i in range(1, len(notes)):
-        if notes[i] != current_note:
-            dur = (i - start_time) * frame_duration
-            note_events.append({"midi": current_note, "duration_sec": dur})
-            current_note, start_time = notes[i], i
-    dur = (len(notes) - start_time) * frame_duration
-    note_events.append({"midi": current_note, "duration_sec": dur})
-
-    score = stream.Score()
-    part = stream.Part()
-    part.append(meter.TimeSignature("4/4"))
-    part.append(tempo.MetronomeMark(number=bpm))
-    sec_per_beat = 60.0 / bpm
-
-    for ev in note_events:
-        if ev["duration_sec"] < 0.1:
+def extract_notes_with_onsets(
+    audio_path: Path,
+    fmin_note="C1",
+    n_bins=72,
+    n_fft=2048,
+    overlap=0.5,
+    mag_exp=4,
+    cqt_threshold_db=-61,
+    onset_prepost=6,
+    backtrack=True,
+):
+    y, sr = librosa.load(str(audio_path), sr=None, mono=True)
+    hop_length = int(n_fft * (1 - overlap))
+    C = librosa.cqt(
+        y,
+        sr=sr,
+        hop_length=hop_length,
+        fmin=librosa.note_to_hz(fmin_note),
+        n_bins=n_bins,
+    )
+    C_mag = np.abs(C) ** mag_exp
+    CdB = librosa.amplitude_to_db(C_mag, ref=np.max)
+    CdB_thresh = CdB.copy()
+    CdB_thresh[CdB_thresh < cqt_threshold_db] = -120.0
+    onset_env = librosa.onset.onset_strength(
+        S=CdB_thresh, sr=sr, aggregate=np.mean, hop_length=hop_length
+    )
+    onset_frames = librosa.onset.onset_detect(
+        onset_envelope=onset_env,
+        sr=sr,
+        hop_length=hop_length,
+        backtrack=backtrack,
+        pre_max=onset_prepost,
+        post_max=onset_prepost,
+        units="frames",
+    )
+    onset_boundaries = np.concatenate([[0], onset_frames, [CdB.shape[1]]])
+    onset_times = librosa.frames_to_time(onset_boundaries, sr=sr, hop_length=hop_length)
+    tempo_bpm, _ = librosa.beat.beat_track(
+        y=None, sr=sr, onset_envelope=onset_env, hop_length=hop_length
+    )
+    tempo_bpm = float(np.atleast_1d(tempo_bpm)[0])
+    if tempo_bpm <= 0 or np.isnan(tempo_bpm):
+        tempo_bpm = 60.0
+    freqs = librosa.cqt_frequencies(
+        n_bins=n_bins, fmin=librosa.note_to_hz(fmin_note), bins_per_octave=12
+    )
+    notes_info = []
+    for i in range(len(onset_boundaries) - 1):
+        b0 = onset_boundaries[i]
+        b1 = onset_boundaries[i + 1]
+        if b1 <= b0:
             continue
-        n = note.Note(midi=int(round(ev["midi"])))
-        ql = ev["duration_sec"] / sec_per_beat
-        n.duration.quarterLength = round(ql * 4) / 4.0
-        part.append(n)
+        segment = CdB_thresh[:, b0:b1]
+        peak_vals = np.max(segment, axis=1)
+        peak_val = peak_vals.max()
+        if peak_val <= cqt_threshold_db or np.isneginf(peak_val):
+            notes_info.append((None, onset_times[i], onset_times[i + 1], 0.0))
+        else:
+            bin_idx = int(np.argmax(peak_vals))
+            hz = freqs[bin_idx]
+            midi_num = int(round(librosa.hz_to_midi(hz)))
+            vel = float(
+                np.clip(
+                    (peak_vals[bin_idx] - CdB.min()) / (CdB.max() - CdB.min()), 0.0, 1.0
+                )
+            )
+            vel_midi = int(round(vel * 127))
+            notes_info.append((midi_num, onset_times[i], onset_times[i + 1], vel_midi))
+    return notes_info, float(tempo_bpm)
 
-    score.append(part)
-    score.write(fp=str(output_path_musicxml))
-    return output_path_musicxml
+
+def build_musicxml_from_notes(notes_info, tempo_bpm, title="transcription"):
+    s = stream.Score()
+    p = stream.Part()
+    p.append(meter.TimeSignature("4/4"))
+    p.append(tempo.MetronomeMark(number=round(tempo_bpm, 3)))
+    s.insert(0, metadata.Metadata())
+    s.metadata.title = title
+    for midi_num, t0, t1, vel in notes_info:
+        dur_sec = max(0.0, t1 - t0)
+        if dur_sec <= 0.01:
+            continue
+        sec_per_beat = 60.0 / tempo_bpm
+        ql = dur_sec / sec_per_beat
+        ql = round(ql * 16) / 16.0
+        if ql <= 0:
+            ql = 0.25
+        if midi_num is None:
+            r = note.Rest()
+            r.duration.quarterLength = ql
+            p.append(r)
+        else:
+            n = note.Note(midi=int(midi_num))
+            n.duration.quarterLength = ql
+            p.append(n)
+    s.append(p)
+    exporter = GeneralObjectExporter(s)
+    xml_str = exporter.parse()
+    return xml_str
+
+
+def audio_to_musicxml_string(
+    audio_path: Path,
+    fmin_note="C1",
+    n_bins=72,
+    n_fft=2048,
+    overlap=0.5,
+    mag_exp=4,
+    cqt_threshold_db=-61,
+    onset_prepost=6,
+    backtrack=True,
+):
+    notes_info, tempo_bpm = extract_notes_with_onsets(
+        audio_path,
+        fmin_note=fmin_note,
+        n_bins=n_bins,
+        n_fft=n_fft,
+        overlap=overlap,
+        mag_exp=mag_exp,
+        cqt_threshold_db=cqt_threshold_db,
+        onset_prepost=onset_prepost,
+        backtrack=backtrack,
+    )
+    xml_str = build_musicxml_from_notes(notes_info, tempo_bpm, title=audio_path.stem)
+    return xml_str
 
 
 @app.get("/transcribe")
@@ -156,9 +249,11 @@ async def transcribe_existing_stem(stem: str = Query(...)):
     if not stem_path.exists():
         return {"error": f"Stem file not found: {stem}"}
 
-    output_xml = stem_path.with_suffix(".musicxml")
-    await asyncio.to_thread(audio_to_sheet_music, stem_path, output_xml)
-    return FileResponse(output_xml, filename=output_xml.name)
+    xml_str = await asyncio.to_thread(audio_to_musicxml_string, stem_path)
+    if isinstance(xml_str, bytes):
+        xml_str = xml_str.decode("utf-8")
+
+    return JSONResponse(content={"status": "ok", "xml": xml_str})
 
 
 # --- Static File Server ---

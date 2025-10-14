@@ -2,3 +2,5 @@ musdb18/
 venv/
 .env
 separated_audio/
+__pycache__/
+
