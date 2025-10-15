@@ -42,7 +42,7 @@ app = FastAPI(title="Demucs Live Update API")
 # Allow the frontend (even when opened as a local file) to talk to the API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://aryanjumani.com", "http://localhost:5000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

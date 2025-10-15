@@ -43,7 +43,7 @@ class _FileUploadViewState extends State<FileUploadView> {
     StreamController<String> log,
     Completer<List<Stem>> completer,
   ) async {
-    const apiUrl = 'http://127.0.0.1:8000/separate-live';
+    const apiUrl = 'http://api.aryanjumani.com/separate-live';
     var request = http.MultipartRequest('POST', Uri.parse(apiUrl))
       ..files.add(
         http.MultipartFile.fromBytes(

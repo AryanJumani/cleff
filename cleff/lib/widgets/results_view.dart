@@ -40,7 +40,7 @@ class _ResultsViewState extends State<ResultsView> {
   void initState() {
     super.initState();
     _players = widget.results.map((stem) {
-      final url = 'http://127.0.0.1:8000/${stem.path}';
+      final url = 'http://api.aryanjumani.com/${stem.path}';
       return AudioPlayer()..setUrl(url);
     }).toList();
 
@@ -89,7 +89,7 @@ class _ResultsViewState extends State<ResultsView> {
 
   Future<void> _downloadStem(Stem stem) async {
     try {
-      final url = 'http://127.0.0.1:8000/${stem.path}';
+      final url = 'http://api.aryanjumani.com/${stem.path}';
       final response = await http.get(Uri.parse(url));
       if (kIsWeb) {
         await downloadFileWeb(response.bodyBytes, '${stem.name}.mp3');
@@ -126,7 +126,7 @@ class _ResultsViewState extends State<ResultsView> {
     );
 
     try {
-      final url = 'http://127.0.0.1:8000/transcribe?stem=${stem.path}';
+      final url = 'http://api.aryanjumani.com/transcribe?stem=${stem.path}';
       final response = await http.get(Uri.parse(url));
 
       Navigator.pop(context); // Close the loading dialog
