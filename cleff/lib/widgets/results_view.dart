@@ -11,6 +11,7 @@ import '../main.dart';
 import 'stem_player_widget.dart';
 import 'dart:html' as html;
 import 'package:flutter/foundation.dart' show kIsWeb;
+import 'dart:convert';
 
 class ResultsView extends StatefulWidget {
   final List<Stem> results;
@@ -103,24 +104,58 @@ class _ResultsViewState extends State<ResultsView> {
   }
 
   Future<void> _generateSheetMusic(Stem stem) async {
+    // Show a loading dialog for better user experience
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext context) {
+        return const Dialog(
+          child: Padding(
+            padding: EdgeInsets.all(20.0),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                CircularProgressIndicator(),
+                SizedBox(width: 20),
+                Text("Generating file..."),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+
     try {
       final url = 'http://127.0.0.1:8000/transcribe?stem=${stem.path}';
       final response = await http.get(Uri.parse(url));
+
+      Navigator.pop(context); // Close the loading dialog
 
       if (response.statusCode != 200) {
         debugPrint('Sheet generation failed: ${response.statusCode}');
         return;
       }
 
+      // This is the original download logic
       if (kIsWeb) {
-        await downloadFileWeb(response.bodyBytes, '${stem.name}.musicxml');
+        // The server returns a JSON object, so we need to decode it first
+        final Map<String, dynamic> data = json.decode(response.body);
+        final String xmlContent = data['xml'] ?? '';
+        // Convert the string content to bytes for download
+        final Uint8List fileBytes = utf8.encode(xmlContent);
+        await downloadFileWeb(fileBytes, '${stem.name}.musicxml');
       } else {
+        final Map<String, dynamic> data = json.decode(response.body);
+        final String xmlContent = data['xml'] ?? '';
+        final Uint8List fileBytes = utf8.encode(xmlContent);
+
         final dir = await getApplicationDocumentsDirectory();
         final file = File('${dir.path}/${stem.name}.musicxml');
-        await file.writeAsBytes(response.bodyBytes);
+        await file.writeAsBytes(fileBytes);
         OpenFile.open(file.path);
       }
     } catch (e) {
+      Navigator.pop(context); // Close dialog on error
       debugPrint('Sheet generation error: $e');
     }
   }
